@@ -1,4 +1,5 @@
 # Nexus-cli Linux内存优化版
+Mac版:https://github.com/huahua1220/nexus-cli-mac
 
 有问题联系推特：https://x.com/hua_web3
 
