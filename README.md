@@ -25,7 +25,7 @@ cargo build --release
 ## 使用方法
 
 ### 准备节点文件
-运行前先打开 `target/release/nodes.txt` 文件，一行一个节点ID
+运行前先打开 `sudo nano ./target/release/nodes.txt` 文件，一行一个节点ID
 
 ### 批量模式
 ```bash
