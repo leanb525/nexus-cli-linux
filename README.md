@@ -17,7 +17,7 @@ source ~/.bashrc
 ### 2. 克隆并编译
 ```bash
 # 克隆并编译
-git clone https://github.com/huahua1220/nexus-cli-linux.git
+sudo git clone https://github.com/huahua1220/nexus-cli-linux.git
 cd nexus-cli-linux
 cargo build --release
 ```
