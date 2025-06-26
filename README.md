@@ -30,7 +30,7 @@ cargo build --release
 ### 批量模式
 ```bash
 # 运行批量挖矿
-./target/release/nexus batch-file --file nodes.txt --max-concurrent 节点数
+./target/release/nexus batch-file --file ./target/release/nodes.txt --max-concurrent 节点数
 ```
 
 ## 主要改进
