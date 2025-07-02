@@ -117,10 +117,12 @@ fn get_config_path() -> Result<PathBuf, ()> {
 /// Memory tracking for performance monitoring
 #[derive(Debug)]
 struct MemoryTracker {
+    #[allow(dead_code)]  // 添加这行
     initial_rss: AtomicU64,
     peak_rss: AtomicU64,
+    #[allow(dead_code)]  // 添加这行
     allocations: AtomicU64,
-}
+} 
 
 impl MemoryTracker {
     fn new() -> Self {
@@ -207,8 +209,9 @@ impl StringPool {
     }
 }
 
-/// Smart status cache with LRU eviction - 修复Debug trait
+/// Smart status cache with LRU eviction
 struct StatusCache {
+    #[allow(dead_code)]  // 添加这行
     cache: tokio::sync::Mutex<LruCache<u64, CompactString>>,
     hit_count: AtomicU64,
     miss_count: AtomicU64,
@@ -225,6 +228,7 @@ impl StatusCache {
         }
     }
     
+    #[allow(dead_code)]  // 添加这行
     async fn get_or_insert<F>(&self, key: u64, f: F) -> CompactString
     where
         F: FnOnce() -> CompactString,
@@ -267,6 +271,7 @@ impl std::fmt::Debug for StatusCache {
 
 /// Optimized task pool with semaphore-based concurrency control
 struct TaskPool {
+    #[allow(dead_code)]  // 添加这行
     semaphore: Arc<Semaphore>,
     active_tasks: AtomicUsize,
     completed_tasks: AtomicU64,
@@ -418,7 +423,7 @@ impl FixedLineDisplay {
         print!("\x1b[2J\x1b[H");
 
         // Use string pool for time formatting
-        let mut time_buffer = self.string_pool.get_string().await;
+        let time_buffer = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
         let _ = write!(time_buffer, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
 
         // Title - 修复: 移除emoji，使用ASCII字符
@@ -486,7 +491,7 @@ impl FixedLineDisplay {
         println!("Press Ctrl+C to stop all miners");
 
         // Return string to pool
-        self.string_pool.return_string(time_buffer).await;
+        let time_buffer = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
 
         // 修复: 使用标准库flush
         let _ = io::stdout().flush();
