@@ -20,8 +20,8 @@ use ratatui::{
 };
 use std::error::Error;
 use std::path::PathBuf;
-use std::io;
-use std::fmt::Write;
+use std::io::{self, Write}; // 修复: 使用标准库的Write
+use std::fmt::Write as FmtWrite; // 修复: 区分格式化Write
 use tokio::task::JoinSet;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -33,7 +33,6 @@ use compact_str::CompactString;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use rayon::prelude::*;
-use tokio::io::{AsyncWriteExt, BufWriter};
 
 mod analytics;
 mod config;
@@ -200,7 +199,7 @@ impl StringPool {
     }
 }
 
-/// Smart status cache with LRU eviction
+/// Smart status cache with LRU eviction - 修复Debug trait
 struct StatusCache {
     cache: tokio::sync::Mutex<LruCache<u64, CompactString>>,
     hit_count: AtomicU64,
@@ -248,6 +247,16 @@ impl StatusCache {
     }
 }
 
+// 修复Debug trait for StatusCache
+impl std::fmt::Debug for StatusCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatusCache")
+            .field("hit_count", &self.hit_count.load(Ordering::Relaxed))
+            .field("miss_count", &self.miss_count.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 /// Optimized task pool with semaphore-based concurrency control
 struct TaskPool {
     semaphore: Arc<Semaphore>,
@@ -266,30 +275,6 @@ impl TaskPool {
         }
     }
     
-    async fn spawn_task<F, Fut, T>(&self, f: F) -> tokio::task::JoinHandle<T>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
-        let active_counter = self.active_tasks.clone();
-        let completed_counter = self.completed_tasks.clone();
-        let failed_counter = self.failed_tasks.clone();
-        
-        active_counter.fetch_add(1, Ordering::Relaxed);
-        
-        tokio::spawn(async move {
-            let _permit = permit; // Automatically released when dropped
-            let result = f().await;
-            
-            active_counter.fetch_sub(1, Ordering::Relaxed);
-            completed_counter.fetch_add(1, Ordering::Relaxed);
-            
-            result
-        })
-    }
-    
     fn get_stats(&self) -> (usize, u64, u64) {
         (
             self.active_tasks.load(Ordering::Relaxed),
@@ -302,6 +287,7 @@ impl TaskPool {
 /// Optimized fixed line display manager with advanced memory management
 #[derive(Debug)]
 struct FixedLineDisplay {
+    #[allow(dead_code)]
     max_lines: usize,
     node_lines: Arc<tokio::sync::RwLock<HashMap<u64, CompactString>>>,
     last_render_hash: Arc<tokio::sync::Mutex<u64>>,
@@ -309,7 +295,6 @@ struct FixedLineDisplay {
     string_pool: Arc<StringPool>,
     status_cache: Arc<StatusCache>,
     memory_tracker: Arc<MemoryTracker>,
-    buffer_writer: Arc<tokio::sync::Mutex<BufWriter<tokio::io::Stdout>>>,
 }
 
 impl FixedLineDisplay {
@@ -324,9 +309,6 @@ impl FixedLineDisplay {
             string_pool: Arc::new(StringPool::new(max_lines * 2)),
             status_cache: Arc::new(StatusCache::new(max_lines * 4)),
             memory_tracker: Arc::new(MemoryTracker::new()),
-            buffer_writer: Arc::new(tokio::sync::Mutex::new(
-                BufWriter::new(tokio::io::stdout())
-            )),
         }
     }
 
@@ -348,6 +330,7 @@ impl FixedLineDisplay {
         }
     }
 
+    #[allow(dead_code)]
     async fn remove_node(&self, node_id: u64) {
         {
             let mut lines = self.node_lines.write().await;
@@ -366,11 +349,11 @@ impl FixedLineDisplay {
             let result = self.defragmenter.defragment().await;
             
             if result.was_critical {
-                println!("🚨 Critical memory cleanup complete:");
+                println!("Critical memory cleanup complete:");
             } else {
-                println!("🔧 Regular memory cleanup complete:");
+                println!("Regular memory cleanup complete:");
             }
-            println!("   Memory: {:.1}% → {:.1}% (freed {:.1}%)", 
+            println!("   Memory: {:.1}% -> {:.1}% (freed {:.1}%)", 
                      result.memory_before * 100.0, 
                      result.memory_after * 100.0,
                      result.memory_freed_percentage());
@@ -379,7 +362,7 @@ impl FixedLineDisplay {
 
         // Legacy memory pressure check as backup
         if crate::utils::system::check_memory_pressure() {
-            println!("⚠️ High memory usage detected, performing additional cleanup...");
+            println!("High memory usage detected, performing additional cleanup...");
             crate::utils::system::perform_memory_cleanup();
         }
 
@@ -413,18 +396,16 @@ impl FixedLineDisplay {
     }
 
     async fn render_display(&self, lines: &HashMap<u64, CompactString>) {
-        let mut buffer_writer = self.buffer_writer.lock().await;
-        
-        // Clear screen and move to top
-        let _ = buffer_writer.write_all(b"\x1b[2J\x1b[H").await;
+        // 修复: 使用print!而不是异步写入
+        print!("\x1b[2J\x1b[H");
 
         // Use string pool for time formatting
         let mut time_buffer = self.string_pool.get_string().await;
         let _ = write!(time_buffer, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
 
-        // Title
-        let _ = write!(buffer_writer, "🚀 Nexus Enhanced Batch Mining Monitor - {}\n", time_buffer).await;
-        let _ = buffer_writer.write_all(b"═══════════════════════════════════════\n").await;
+        // Title - 修复: 移除emoji，使用ASCII字符
+        println!("Nexus Enhanced Batch Mining Monitor - {}", time_buffer);
+        println!("=======================================");
 
         // Optimized statistics calculation using parallel processing
         let (total_nodes, successful_count, failed_count, active_count) = if lines.len() > 50 {
@@ -433,9 +414,9 @@ impl FixedLineDisplay {
                     let status_str = status.as_str();
                     (
                         1,
-                        if status_str.contains("✅") || status_str.contains("Success") { 1 } else { 0 },
-                        if status_str.contains("❌") || status_str.contains("Error") { 1 } else { 0 },
-                        if status_str.contains("🔄") || status_str.contains("⚠️") || status_str.contains("Task Fetcher") { 1 } else { 0 },
+                        if status_str.contains("Success") || status_str.contains("OK") { 1 } else { 0 },
+                        if status_str.contains("Error") || status_str.contains("Failed") { 1 } else { 0 },
+                        if status_str.contains("Running") || status_str.contains("Active") || status_str.contains("Task Fetcher") { 1 } else { 0 },
                     )
                 })
                 .reduce(|| (0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3))
@@ -444,53 +425,53 @@ impl FixedLineDisplay {
                 let status_str = status.as_str();
                 (
                     total + 1,
-                    success + if status_str.contains("✅") || status_str.contains("Success") { 1 } else { 0 },
-                    failed + if status_str.contains("❌") || status_str.contains("Error") { 1 } else { 0 },
-                    active + if status_str.contains("🔄") || status_str.contains("⚠️") || status_str.contains("Task Fetcher") { 1 } else { 0 },
+                    success + if status_str.contains("Success") || status_str.contains("OK") { 1 } else { 0 },
+                    failed + if status_str.contains("Error") || status_str.contains("Failed") { 1 } else { 0 },
+                    active + if status_str.contains("Running") || status_str.contains("Active") || status_str.contains("Task Fetcher") { 1 } else { 0 },
                 )
             })
         };
 
-        let _ = write!(buffer_writer, "📊 Status: {} Total | {} Active | {} Success | {} Failed\n", 
-                     total_nodes, active_count, successful_count, failed_count).await;
+        println!("Status: {} Total | {} Active | {} Success | {} Failed", 
+                 total_nodes, active_count, successful_count, failed_count);
 
         // Enhanced memory statistics
         let stats = self.defragmenter.get_stats().await;
         let cache_hit_rate = self.status_cache.get_hit_rate() * 100.0;
         
         if stats.total_checks > 0 {
-            let _ = write!(buffer_writer, "🧠 Memory: {:.1}% | Cache: {:.1}% hit | Cleanups: {} | Freed: {} KB\n", 
-                         crate::utils::system::get_memory_usage_ratio() * 100.0,
-                         cache_hit_rate,
-                         stats.cleanups_performed,
-                         stats.bytes_freed / 1024).await;
+            println!("Memory: {:.1}% | Cache: {:.1}% hit | Cleanups: {} | Freed: {} KB", 
+                     crate::utils::system::get_memory_usage_ratio() * 100.0,
+                     cache_hit_rate,
+                     stats.cleanups_performed,
+                     stats.bytes_freed / 1024);
         } else {
             let (used_mb, total_mb) = crate::utils::system::get_memory_info();
             let usage_percentage = (used_mb as f64 / total_mb as f64) * 100.0;
-            let _ = write!(buffer_writer, "🧠 Memory: {:.1}% ({} MB / {} MB) | Cache: {:.1}%\n", 
-                         usage_percentage, used_mb, total_mb, cache_hit_rate).await;
+            println!("Memory: {:.1}% ({} MB / {} MB) | Cache: {:.1}%", 
+                     usage_percentage, used_mb, total_mb, cache_hit_rate);
         }
 
-        let _ = buffer_writer.write_all(b"───────────────────────────────────────\n").await;
+        println!("---------------------------------------");
 
         // Optimized sorting using SmallVec for better performance with small collections
         let mut sorted_lines: SmallVec<[_; 32]> = SmallVec::with_capacity(lines.len());
         sorted_lines.extend(lines.iter());
         sorted_lines.sort_unstable_by_key(|(id, _)| *id);
 
-        // Batch write node statuses
+        // Write node statuses
         for (node_id, status) in sorted_lines.iter() {
-            let _ = write!(buffer_writer, "Node-{}: {}\n", node_id, status).await;
+            println!("Node-{}: {}", node_id, status);
         }
 
-        let _ = buffer_writer.write_all(b"───────────────────────────────────────\n").await;
-        let _ = buffer_writer.write_all(b"💡 Press Ctrl+C to stop all miners\n").await;
-
-        // Flush all output at once
-        let _ = buffer_writer.flush().await;
+        println!("---------------------------------------");
+        println!("Press Ctrl+C to stop all miners");
 
         // Return string to pool
         self.string_pool.return_string(time_buffer).await;
+
+        // 修复: 使用标准库flush
+        let _ = io::stdout().flush();
     }
 }
 
@@ -540,9 +521,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             NodeList::create_example_files(&dir)
                 .map_err(|e| -> Box<dyn Error> { Box::new(e) })?;
 
-            println!("🎉 Example node list files created successfully!");
-            println!("📂 Location: {}", dir);
-            println!("💡 Edit these files with your actual node IDs, then use:");
+            println!("Example node list files created successfully!");
+            println!("Location: {}", dir);
+            println!("Edit these files with your actual node IDs, then use:");
             println!("   nexus batch-file --file {}/example_nodes.txt", dir);
             Ok(())
         }
@@ -594,7 +575,7 @@ async fn start_headless_prover(
     node_id: Option<u64>,
     env: Environment,
 ) -> Result<(), Box<dyn Error>> {
-    println!("🚀 Starting Nexus Prover in headless mode...");
+    println!("Starting Nexus Prover in headless mode...");
     prover::start_prover(env, node_id).await?;
     Ok(())
 }
@@ -617,15 +598,15 @@ async fn start_batch_from_file_with_runtime(
 
     let actual_concurrent = max_concurrent.min(all_nodes.len());
 
-    println!("🚀 Nexus Enhanced Runtime Batch Mode");
-    println!("📁 Node file: {}", file_path);
-    println!("📊 Total nodes: {}", all_nodes.len());
-    println!("🔄 Max concurrent: {}", actual_concurrent);
-    println!("⏱️  Start delay: {:.1}s, Proof interval: {}s", start_delay, proof_interval);
-    println!("🌍 Environment: {:?}", env);
-    println!("🎯 Architecture: High-efficiency prover_runtime");
-    println!("🧠 Memory optimization: ENABLED");
-    println!("───────────────────────────────────────");
+    println!("Nexus Enhanced Runtime Batch Mode");
+    println!("Node file: {}", file_path);
+    println!("Total nodes: {}", all_nodes.len());
+    println!("Max concurrent: {}", actual_concurrent);
+    println!("Start delay: {:.1}s, Proof interval: {}s", start_delay, proof_interval);
+    println!("Environment: {:?}", env);
+    println!("Architecture: High-efficiency prover_runtime");
+    println!("Memory optimization: ENABLED");
+    println!("---------------------------------------");
 
     // Create optimized display manager
     let display = Arc::new(FixedLineDisplay::new(actual_concurrent));
@@ -633,7 +614,7 @@ async fn start_batch_from_file_with_runtime(
 
     // Use optimized task pool
     let task_pool = Arc::new(TaskPool::new(actual_concurrent));
-    let mut join_set = JoinSet::new();
+    let mut join_set = JoinSet::new(); // 修复: 正确的JoinSet类型
     let (shutdown_sender, _) = broadcast::channel(1);
 
     for (index, node_id) in all_nodes.iter().take(actual_concurrent).enumerate() {
@@ -641,14 +622,14 @@ async fn start_batch_from_file_with_runtime(
         let env = env.clone();
         let display = display.clone();
         let shutdown_rx = shutdown_sender.subscribe();
-        let task_pool = task_pool.clone();
 
         // Add startup delay
         if index > 0 {
             tokio::time::sleep(std::time::Duration::from_secs_f64(start_delay)).await;
         }
 
-        let handle = task_pool.spawn_task(move || async move {
+        // 修复: 直接spawn任务而不是嵌套JoinHandle
+        join_set.spawn(async move {
             let prefix = format!("Node-{}", node_id);
             let display_clone = display.clone();
 
@@ -679,9 +660,7 @@ async fn start_batch_from_file_with_runtime(
             }
 
             Ok::<(), prover::ProverError>(())
-        }).await;
-
-        join_set.spawn(handle);
+        });
     }
 
     // Monitor and error handling
@@ -690,9 +669,9 @@ async fn start_batch_from_file_with_runtime(
     Ok(())
 }
 
-/// Monitor optimized runtime workers
+/// Monitor optimized runtime workers - 修复JoinSet类型
 async fn monitor_runtime_workers(
-    mut join_set: JoinSet<tokio::task::JoinHandle<Result<(), prover::ProverError>>>,
+    mut join_set: JoinSet<Result<(), prover::ProverError>>, // 修复: 正确的类型
     display: Arc<FixedLineDisplay>,
     task_pool: Arc<TaskPool>,
 ) {
@@ -701,24 +680,16 @@ async fn monitor_runtime_workers(
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(task_handle) => {
-                match task_handle.await {
-                    Ok(Ok(())) => {
-                        // Worker completed successfully
-                    }
-                    Ok(Err(e)) => {
-                        error_count += 1;
-                        println!("⚠️ Worker error: {}", e);
-                    }
-                    Err(e) => {
-                        error_count += 1;
-                        println!("💥 Worker panic: {}", e);
-                    }
-                }
+            Ok(Ok(())) => {
+                // Worker completed successfully
+            }
+            Ok(Err(e)) => {
+                error_count += 1;
+                println!("Worker error: {}", e);
             }
             Err(e) => {
                 error_count += 1;
-                println!("🔥 Join error: {}", e);
+                println!("Worker panic: {}", e);
             }
         }
 
@@ -727,7 +698,7 @@ async fn monitor_runtime_workers(
         let elapsed = start_time.elapsed();
         
         if completed % 10 == 0 || error_count > 0 {
-            println!("📈 Runtime Stats - Active: {}, Completed: {}, Failed: {}, Elapsed: {:?}", 
+            println!("Runtime Stats - Active: {}, Completed: {}, Failed: {}, Elapsed: {:?}", 
                      active, completed, failed, elapsed);
         }
 
@@ -737,7 +708,7 @@ async fn monitor_runtime_workers(
     let final_elapsed = start_time.elapsed();
     let (_, final_completed, final_failed) = task_pool.get_stats();
     
-    println!("🏁 Batch processing completed!");
-    println!("📊 Final Stats - Completed: {}, Failed: {}, Total time: {:?}", 
+    println!("Batch processing completed!");
+    println!("Final Stats - Completed: {}, Failed: {}, Total time: {:?}", 
              final_completed, final_failed, final_elapsed);
 }
