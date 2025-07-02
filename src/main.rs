@@ -177,12 +177,33 @@ struct StringPool {
     capacity: usize,
 }
 
-// 添加 Debug trait 实现
 impl std::fmt::Debug for StringPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StringPool")
             .field("capacity", &self.capacity)
             .finish()
+    }
+}
+
+impl StringPool {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pool: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(capacity))),
+            capacity,
+        }
+    }
+    
+    async fn get_string(&self) -> String {
+        let mut pool = self.pool.lock().await;
+        pool.pop().unwrap_or_else(|| String::with_capacity(256))
+    }
+    
+    async fn return_string(&self, mut string: String) {
+        string.clear();
+        let mut pool = self.pool.lock().await;
+        if pool.len() < self.capacity {
+            pool.push(string);
+        }
     }
 }
 
@@ -252,7 +273,6 @@ struct TaskPool {
     failed_tasks: AtomicU64,
 }
 
-// 添加 Debug trait 实现
 impl std::fmt::Debug for TaskPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TaskPool")
