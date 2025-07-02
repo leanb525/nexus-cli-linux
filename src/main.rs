@@ -177,25 +177,12 @@ struct StringPool {
     capacity: usize,
 }
 
-impl StringPool {
-    fn new(capacity: usize) -> Self {
-        Self {
-            pool: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(capacity))),
-            capacity,
-        }
-    }
-    
-    async fn get_string(&self) -> String {
-        let mut pool = self.pool.lock().await;
-        pool.pop().unwrap_or_else(|| String::with_capacity(256))
-    }
-    
-    async fn return_string(&self, mut string: String) {
-        string.clear();
-        let mut pool = self.pool.lock().await;
-        if pool.len() < self.capacity {
-            pool.push(string);
-        }
+// 添加 Debug trait 实现
+impl std::fmt::Debug for StringPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StringPool")
+            .field("capacity", &self.capacity)
+            .finish()
     }
 }
 
@@ -263,6 +250,17 @@ struct TaskPool {
     active_tasks: AtomicUsize,
     completed_tasks: AtomicU64,
     failed_tasks: AtomicU64,
+}
+
+// 添加 Debug trait 实现
+impl std::fmt::Debug for TaskPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskPool")
+            .field("active_tasks", &self.active_tasks.load(Ordering::Relaxed))
+            .field("completed_tasks", &self.completed_tasks.load(Ordering::Relaxed))
+            .field("failed_tasks", &self.failed_tasks.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl TaskPool {
