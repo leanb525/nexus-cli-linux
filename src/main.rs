@@ -21,13 +21,19 @@ use ratatui::{
 use std::error::Error;
 use std::path::PathBuf;
 use std::io;
-// use tokio::signal;
+use std::fmt::Write;
 use tokio::task::JoinSet;
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::hash::Hasher;
-use tokio::sync::broadcast;
-// use once_cell::sync::Lazy; // Remove unused import
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use tokio::sync::{broadcast, Semaphore};
+use smallvec::SmallVec;
+use compact_str::CompactString;
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use rayon::prelude::*;
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 mod analytics;
 mod config;
@@ -37,7 +43,7 @@ mod keys;
 mod nexus_orchestrator;
 mod orchestrator_client;
 mod prover;
-mod prover_runtime;  // New: High-efficiency runtime module
+mod prover_runtime;
 mod setup;
 mod task;
 mod ui;
@@ -65,7 +71,6 @@ enum Command {
         /// Node ID
         #[arg(long, value_name = "NODE_ID")]
         node_id: Option<u64>,
-
         /// Environment to connect to.
         #[arg(long, value_enum)]
         env: Option<Environment>,
@@ -76,28 +81,22 @@ enum Command {
         /// Path to node list file (.txt)
         #[arg(long, value_name = "FILE_PATH")]
         file: String,
-
         /// Environment to connect to.
         #[arg(long, value_enum)]
         env: Option<Environment>,
-
         /// Delay between starting each node (seconds)
-        #[arg(long, default_value = "0.5")]
+        #[arg(long, default_value = "10")]  // Changed from 0.5 to 10
         start_delay: f64,
-
         /// Delay between proof submissions per node (seconds)
         #[arg(long, default_value = "1")]
         proof_interval: u64,
-
         /// Maximum number of concurrent nodes
         #[arg(long, default_value = "10")]
         max_concurrent: usize,
-
         /// Enable verbose error logging
         #[arg(long)]
         verbose: bool,
     },
-
     /// Create example node list files
     CreateExamples {
         /// Directory to create example files
@@ -116,60 +115,254 @@ fn get_config_path() -> Result<PathBuf, ()> {
     Ok(config_path)
 }
 
-// Note: Node pool manager removed, now using simple concurrent processing
+/// Memory tracking for performance monitoring
+#[derive(Debug)]
+struct MemoryTracker {
+    initial_rss: AtomicU64,
+    peak_rss: AtomicU64,
+    allocations: AtomicU64,
+}
 
-/// Fixed line display manager for batch processing with advanced memory optimization
+impl MemoryTracker {
+    fn new() -> Self {
+        let initial_rss = Self::get_current_rss();
+        Self {
+            initial_rss: AtomicU64::new(initial_rss),
+            peak_rss: AtomicU64::new(initial_rss),
+            allocations: AtomicU64::new(0),
+        }
+    }
+    
+    #[cfg(target_os = "linux")]
+    fn get_current_rss() -> u64 {
+        use std::fs;
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|content| {
+                content.lines()
+                    .find(|line| line.starts_with("VmRSS:"))
+                    .and_then(|line| {
+                        line.split_whitespace()
+                            .nth(1)
+                            .and_then(|s| s.parse::<u64>().ok())
+                    })
+            })
+            .unwrap_or(0) * 1024 // Convert KB to bytes
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    fn get_current_rss() -> u64 {
+        0 // Fallback for non-Linux systems
+    }
+    
+    fn update_peak(&self) {
+        let current = Self::get_current_rss();
+        let mut peak = self.peak_rss.load(Ordering::Relaxed);
+        while current > peak {
+            match self.peak_rss.compare_exchange_weak(
+                peak, 
+                current, 
+                Ordering::Relaxed, 
+                Ordering::Relaxed
+            ) {
+                Ok(_) => break,
+                Err(new_peak) => peak = new_peak,
+            }
+        }
+    }
+}
+
+/// Optimized string pool for reducing allocations
+struct StringPool {
+    pool: Arc<tokio::sync::Mutex<Vec<String>>>,
+    capacity: usize,
+}
+
+impl StringPool {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pool: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(capacity))),
+            capacity,
+        }
+    }
+    
+    async fn get_string(&self) -> String {
+        let mut pool = self.pool.lock().await;
+        pool.pop().unwrap_or_else(|| String::with_capacity(256))
+    }
+    
+    async fn return_string(&self, mut string: String) {
+        string.clear();
+        let mut pool = self.pool.lock().await;
+        if pool.len() < self.capacity {
+            pool.push(string);
+        }
+    }
+}
+
+/// Smart status cache with LRU eviction
+struct StatusCache {
+    cache: tokio::sync::Mutex<LruCache<u64, CompactString>>,
+    hit_count: AtomicU64,
+    miss_count: AtomicU64,
+}
+
+impl StatusCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            cache: tokio::sync::Mutex::new(
+                LruCache::new(NonZeroUsize::new(capacity).unwrap())
+            ),
+            hit_count: AtomicU64::new(0),
+            miss_count: AtomicU64::new(0),
+        }
+    }
+    
+    async fn get_or_insert<F>(&self, key: u64, f: F) -> CompactString
+    where
+        F: FnOnce() -> CompactString,
+    {
+        let mut cache = self.cache.lock().await;
+        match cache.get(&key) {
+            Some(value) => {
+                self.hit_count.fetch_add(1, Ordering::Relaxed);
+                value.clone()
+            }
+            None => {
+                self.miss_count.fetch_add(1, Ordering::Relaxed);
+                let value = f();
+                cache.put(key, value.clone());
+                value
+            }
+        }
+    }
+    
+    fn get_hit_rate(&self) -> f64 {
+        let hits = self.hit_count.load(Ordering::Relaxed);
+        let misses = self.miss_count.load(Ordering::Relaxed);
+        if hits + misses == 0 {
+            0.0
+        } else {
+            hits as f64 / (hits + misses) as f64
+        }
+    }
+}
+
+/// Optimized task pool with semaphore-based concurrency control
+struct TaskPool {
+    semaphore: Arc<Semaphore>,
+    active_tasks: AtomicUsize,
+    completed_tasks: AtomicU64,
+    failed_tasks: AtomicU64,
+}
+
+impl TaskPool {
+    fn new(max_concurrent: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            active_tasks: AtomicUsize::new(0),
+            completed_tasks: AtomicU64::new(0),
+            failed_tasks: AtomicU64::new(0),
+        }
+    }
+    
+    async fn spawn_task<F, Fut, T>(&self, f: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+        let active_counter = self.active_tasks.clone();
+        let completed_counter = self.completed_tasks.clone();
+        let failed_counter = self.failed_tasks.clone();
+        
+        active_counter.fetch_add(1, Ordering::Relaxed);
+        
+        tokio::spawn(async move {
+            let _permit = permit; // Automatically released when dropped
+            let result = f().await;
+            
+            active_counter.fetch_sub(1, Ordering::Relaxed);
+            completed_counter.fetch_add(1, Ordering::Relaxed);
+            
+            result
+        })
+    }
+    
+    fn get_stats(&self) -> (usize, u64, u64) {
+        (
+            self.active_tasks.load(Ordering::Relaxed),
+            self.completed_tasks.load(Ordering::Relaxed),
+            self.failed_tasks.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Optimized fixed line display manager with advanced memory management
 #[derive(Debug)]
 struct FixedLineDisplay {
-    #[allow(dead_code)]
     max_lines: usize,
-    node_lines: Arc<tokio::sync::RwLock<HashMap<u64, String>>>,
+    node_lines: Arc<tokio::sync::RwLock<HashMap<u64, CompactString>>>,
     last_render_hash: Arc<tokio::sync::Mutex<u64>>,
     defragmenter: Arc<crate::utils::system::MemoryDefragmenter>,
+    string_pool: Arc<StringPool>,
+    status_cache: Arc<StatusCache>,
+    memory_tracker: Arc<MemoryTracker>,
+    buffer_writer: Arc<tokio::sync::Mutex<BufWriter<tokio::io::Stdout>>>,
 }
 
 impl FixedLineDisplay {
     fn new(max_lines: usize) -> Self {
         Self {
             max_lines,
-            node_lines: Arc::new(tokio::sync::RwLock::new(HashMap::with_capacity(max_lines))),
+            node_lines: Arc::new(tokio::sync::RwLock::new(
+                HashMap::with_capacity(max_lines)
+            )),
             last_render_hash: Arc::new(tokio::sync::Mutex::new(0)),
             defragmenter: Arc::new(crate::utils::system::MemoryDefragmenter::new()),
+            string_pool: Arc::new(StringPool::new(max_lines * 2)),
+            status_cache: Arc::new(StatusCache::new(max_lines * 4)),
+            memory_tracker: Arc::new(MemoryTracker::new()),
+            buffer_writer: Arc::new(tokio::sync::Mutex::new(
+                BufWriter::new(tokio::io::stdout())
+            )),
         }
     }
 
     async fn update_node_status(&self, node_id: u64, status: String) {
-        // Status from prover_runtime already contains timestamp, no need to add another one
+        // Convert to CompactString for better memory efficiency
+        let compact_status = CompactString::new(&status);
+        
         let needs_update = {
             let lines = self.node_lines.read().await;
-            lines.get(&node_id) != Some(&status)
+            lines.get(&node_id) != Some(&compact_status)
         };
-        
+
         if needs_update {
             {
                 let mut lines = self.node_lines.write().await;
-                lines.insert(node_id, status);
+                lines.insert(node_id, compact_status);
             }
             self.render_display_optimized().await;
         }
     }
 
-    #[allow(dead_code)]
     async fn remove_node(&self, node_id: u64) {
         {
             let mut lines = self.node_lines.write().await;
             lines.remove(&node_id);
         }
+        self.render_display_optimized().await;
     }
 
-    // Note: Replacement information feature removed
-
     async fn render_display_optimized(&self) {
-        let lines = self.node_lines.read().await;
+        self.memory_tracker.update_peak();
         
-        // Check for memory defragmentation (enhanced version from 0.8.8)
+        let lines = self.node_lines.read().await;
+
+        // Enhanced memory defragmentation check
         if self.defragmenter.should_defragment().await {
-            println!("🧹 Performing memory defragmentation...");
             let result = self.defragmenter.defragment().await;
             
             if result.was_critical {
@@ -182,29 +375,35 @@ impl FixedLineDisplay {
                      result.memory_after * 100.0,
                      result.memory_freed_percentage());
             println!("   Freed space: {} KB", result.bytes_freed / 1024);
-            
-            // Force a hash recalculation after defragmentation
-            let mut last_hash = self.last_render_hash.lock().await;
-            *last_hash = 0; // Reset to force refresh
-            drop(last_hash);
         }
 
         // Legacy memory pressure check as backup
         if crate::utils::system::check_memory_pressure() {
             println!("⚠️ High memory usage detected, performing additional cleanup...");
             crate::utils::system::perform_memory_cleanup();
-            let mut last_hash = self.last_render_hash.lock().await;
-            *last_hash = 0; // Reset to force refresh
-            drop(last_hash);
         }
-        
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (id, status) in lines.iter() {
-            hasher.write_u64(*id);
-            hasher.write(status.as_bytes());
-        }
-        let current_hash = hasher.finish();
-        
+
+        // Optimized hash calculation using parallel processing for large datasets
+        let current_hash = if lines.len() > 100 {
+            // Use parallel hashing for large datasets
+            lines.par_iter()
+                .map(|(id, status)| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    hasher.write_u64(*id);
+                    hasher.write(status.as_bytes());
+                    hasher.finish()
+                })
+                .reduce(|| 0, |a, b| a ^ b)
+        } else {
+            // Use sequential hashing for small datasets
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for (id, status) in lines.iter() {
+                hasher.write_u64(*id);
+                hasher.write(status.as_bytes());
+            }
+            hasher.finish()
+        };
+
         let mut last_hash = self.last_render_hash.lock().await;
         if *last_hash != current_hash {
             *last_hash = current_hash;
@@ -213,80 +412,100 @@ impl FixedLineDisplay {
         }
     }
 
-    async fn render_display(&self, lines: &HashMap<u64, String>) {
-        // 清屏并移动到顶部
-        print!("\x1b[2J\x1b[H");
+    async fn render_display(&self, lines: &HashMap<u64, CompactString>) {
+        let mut buffer_writer = self.buffer_writer.lock().await;
         
-        // Use cached string for time formatting
-        let mut time_str = self.defragmenter.get_cached_string(64).await;
-        time_str.push_str(&chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-        
-        // 标题
-        println!("🚀 Nexus Enhanced Batch Mining Monitor - {}", time_str);
-        println!("═══════════════════════════════════════");
-        
-        // 统计信息 - 优化迭代器链避免多次遍历
-        let (total_nodes, successful_count, failed_count, active_count) = lines.values()
-            .fold((0, 0, 0, 0), |(total, success, failed, active), status| {
-                let new_total = total + 1;
-                let new_success = if status.contains("✅") || status.contains("Success") { success + 1 } else { success };
-                let new_failed = if status.contains("❌") || status.contains("Error") { failed + 1 } else { failed };
-                let new_active = if status.contains("🔄") || status.contains("⚠️") || status.contains("Task Fetcher") { active + 1 } else { active };
-                (new_total, new_success, new_failed, new_active)
-            });
-        
-        println!("📊 Status: {} Total | {} Active | {} Success | {} Failed", 
-                 total_nodes, active_count, successful_count, failed_count);
-        
-        // Show memory statistics periodically (enhanced from 0.8.8)
-        let stats = self.defragmenter.get_stats().await;
-        if stats.total_checks > 0 {
-            let cache_hit_rate = (stats.cache_hits as f64 / (stats.cache_hits + stats.cache_misses).max(1) as f64) * 100.0;
-            println!("🧠 Memory: {:.1}% | Cache: {:.1}% hit rate | Cleanups: {} | Freed: {} KB", 
-                     crate::utils::system::get_memory_usage_ratio() * 100.0,
-                     cache_hit_rate,
-                     stats.cleanups_performed,
-                     stats.bytes_freed / 1024);
+        // Clear screen and move to top
+        let _ = buffer_writer.write_all(b"\x1b[2J\x1b[H").await;
+
+        // Use string pool for time formatting
+        let mut time_buffer = self.string_pool.get_string().await;
+        let _ = write!(time_buffer, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+
+        // Title
+        let _ = write!(buffer_writer, "🚀 Nexus Enhanced Batch Mining Monitor - {}\n", time_buffer).await;
+        let _ = buffer_writer.write_all(b"═══════════════════════════════════════\n").await;
+
+        // Optimized statistics calculation using parallel processing
+        let (total_nodes, successful_count, failed_count, active_count) = if lines.len() > 50 {
+            lines.par_iter()
+                .map(|(_, status)| {
+                    let status_str = status.as_str();
+                    (
+                        1,
+                        if status_str.contains("✅") || status_str.contains("Success") { 1 } else { 0 },
+                        if status_str.contains("❌") || status_str.contains("Error") { 1 } else { 0 },
+                        if status_str.contains("🔄") || status_str.contains("⚠️") || status_str.contains("Task Fetcher") { 1 } else { 0 },
+                    )
+                })
+                .reduce(|| (0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3))
         } else {
-            // Fallback to basic memory info
+            lines.iter().fold((0, 0, 0, 0), |(total, success, failed, active), (_, status)| {
+                let status_str = status.as_str();
+                (
+                    total + 1,
+                    success + if status_str.contains("✅") || status_str.contains("Success") { 1 } else { 0 },
+                    failed + if status_str.contains("❌") || status_str.contains("Error") { 1 } else { 0 },
+                    active + if status_str.contains("🔄") || status_str.contains("⚠️") || status_str.contains("Task Fetcher") { 1 } else { 0 },
+                )
+            })
+        };
+
+        let _ = write!(buffer_writer, "📊 Status: {} Total | {} Active | {} Success | {} Failed\n", 
+                     total_nodes, active_count, successful_count, failed_count).await;
+
+        // Enhanced memory statistics
+        let stats = self.defragmenter.get_stats().await;
+        let cache_hit_rate = self.status_cache.get_hit_rate() * 100.0;
+        
+        if stats.total_checks > 0 {
+            let _ = write!(buffer_writer, "🧠 Memory: {:.1}% | Cache: {:.1}% hit | Cleanups: {} | Freed: {} KB\n", 
+                         crate::utils::system::get_memory_usage_ratio() * 100.0,
+                         cache_hit_rate,
+                         stats.cleanups_performed,
+                         stats.bytes_freed / 1024).await;
+        } else {
             let (used_mb, total_mb) = crate::utils::system::get_memory_info();
             let usage_percentage = (used_mb as f64 / total_mb as f64) * 100.0;
-            println!("🧠 Memory: {:.1}% ({} MB / {} MB)", usage_percentage, used_mb, total_mb);
+            let _ = write!(buffer_writer, "🧠 Memory: {:.1}% ({} MB / {} MB) | Cache: {:.1}%\n", 
+                         usage_percentage, used_mb, total_mb, cache_hit_rate).await;
         }
-        
-        println!("───────────────────────────────────────");
-        
-        // 按节点ID排序显示 - 预分配容量
-        let mut sorted_lines: Vec<_> = Vec::with_capacity(lines.len());
+
+        let _ = buffer_writer.write_all(b"───────────────────────────────────────\n").await;
+
+        // Optimized sorting using SmallVec for better performance with small collections
+        let mut sorted_lines: SmallVec<[_; 32]> = SmallVec::with_capacity(lines.len());
         sorted_lines.extend(lines.iter());
         sorted_lines.sort_unstable_by_key(|(id, _)| *id);
-        
-        for (node_id, status) in sorted_lines {
-            println!("Node-{}: {}", node_id, status);
+
+        // Batch write node statuses
+        for (node_id, status) in sorted_lines.iter() {
+            let _ = write!(buffer_writer, "Node-{}: {}\n", node_id, status).await;
         }
-        
-        println!("───────────────────────────────────────");
-        println!("💡 Press Ctrl+C to stop all miners");
-        
-        // Return time string to cache
-        self.defragmenter.return_string(time_str).await;
-        
-        // 强制刷新输出
-        use std::io::Write;
-        std::io::stdout().flush().unwrap();
+
+        let _ = buffer_writer.write_all(b"───────────────────────────────────────\n").await;
+        let _ = buffer_writer.write_all(b"💡 Press Ctrl+C to stop all miners\n").await;
+
+        // Flush all output at once
+        let _ = buffer_writer.flush().await;
+
+        // Return string to pool
+        self.string_pool.return_string(time_buffer).await;
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize logger
-    env_logger::init();
-    
+    // Initialize logger with optimized settings
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .format_timestamp_secs()
+        .init();
+
     let args = Args::parse();
     match args.command {
         Command::Start { node_id, env } => {
             let mut node_id = node_id;
-            // If no node ID is provided, try to load it from the config file.
             let config_path = get_config_path().expect("Failed to get config path");
             if node_id.is_none() && config_path.exists() {
                 if let Ok(config) = Config::load_from_file(&config_path) {
@@ -297,11 +516,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     node_id = Some(node_id_as_u64);
                 }
             }
-
             let environment = env.unwrap_or_default();
             start(node_id, environment).await
         }
-        
+
         Command::BatchFile {
             file,
             env,
@@ -317,18 +535,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let environment = env.unwrap_or_default();
             start_batch_from_file_with_runtime(&file, environment, start_delay, proof_interval, max_concurrent, verbose).await
         }
-
+        
         Command::CreateExamples { dir } => {
             NodeList::create_example_files(&dir)
                 .map_err(|e| -> Box<dyn Error> { Box::new(e) })?;
-            
+
             println!("🎉 Example node list files created successfully!");
             println!("📂 Location: {}", dir);
             println!("💡 Edit these files with your actual node IDs, then use:");
             println!("   nexus batch-file --file {}/example_nodes.txt", dir);
             Ok(())
         }
-        
+
         Command::Logout => {
             let config_path = get_config_path().expect("Failed to get config path");
             clear_node_config(&config_path).map_err(Into::into)
@@ -339,10 +557,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// Starts the Nexus CLI application.
 async fn start(node_id: Option<u64>, env: Environment) -> Result<(), Box<dyn Error>> {
     if node_id.is_some() {
-        // Use headless mode for single node with ID
         start_headless_prover(node_id, env).await
     } else {
-        // Use UI mode for interactive setup
         start_with_ui(node_id, env).await
     }
 }
@@ -352,17 +568,14 @@ async fn start_with_ui(
     node_id: Option<u64>,
     env: Environment,
 ) -> Result<(), Box<dyn Error>> {
-    // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create app and run it
     let res = ui::run(&mut terminal, ui::App::new(node_id, env, crate::orchestrator_client::OrchestratorClient::new(env)));
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -370,11 +583,10 @@ async fn start_with_ui(
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-
+    
     if let Err(err) = res {
         println!("{err:?}");
     }
-
     Ok(())
 }
 
@@ -387,7 +599,7 @@ async fn start_headless_prover(
     Ok(())
 }
 
-/// 高效批处理启动器 - 使用prover_runtime架构 (解决内存占用过高问题)
+/// High-efficiency batch launcher using optimized prover_runtime architecture
 async fn start_batch_from_file_with_runtime(
     file_path: &str,
     env: Environment,
@@ -398,13 +610,13 @@ async fn start_batch_from_file_with_runtime(
 ) -> Result<(), Box<dyn Error>> {
     let node_list = node_list::NodeList::load_from_file(file_path)?;
     let all_nodes = node_list.node_ids().to_vec();
-    
+
     if all_nodes.is_empty() {
         return Err("Empty node list".into());
     }
-    
+
     let actual_concurrent = max_concurrent.min(all_nodes.len());
-    
+
     println!("🚀 Nexus Enhanced Runtime Batch Mode");
     println!("📁 Node file: {}", file_path);
     println!("📊 Total nodes: {}", all_nodes.len());
@@ -414,31 +626,33 @@ async fn start_batch_from_file_with_runtime(
     println!("🎯 Architecture: High-efficiency prover_runtime");
     println!("🧠 Memory optimization: ENABLED");
     println!("───────────────────────────────────────");
-    
-    // 创建高级显示管理器
+
+    // Create optimized display manager
     let display = Arc::new(FixedLineDisplay::new(actual_concurrent));
-    display.render_display(&std::collections::HashMap::new()).await;
-    
-    // 使用高效工作池为每个节点
+    display.render_display(&HashMap::new()).await;
+
+    // Use optimized task pool
+    let task_pool = Arc::new(TaskPool::new(actual_concurrent));
     let mut join_set = JoinSet::new();
     let (shutdown_sender, _) = broadcast::channel(1);
-    
+
     for (index, node_id) in all_nodes.iter().take(actual_concurrent).enumerate() {
         let node_id = *node_id;
         let env = env.clone();
         let display = display.clone();
         let shutdown_rx = shutdown_sender.subscribe();
-        
-        // 添加启动延迟
+        let task_pool = task_pool.clone();
+
+        // Add startup delay
         if index > 0 {
             tokio::time::sleep(std::time::Duration::from_secs_f64(start_delay)).await;
         }
-        
-        join_set.spawn(async move {
+
+        let handle = task_pool.spawn_task(move || async move {
             let prefix = format!("Node-{}", node_id);
             let display_clone = display.clone();
-            
-            // 创建状态回调函数用于固定位置显示
+
+            // Create status callback for fixed position display
             let status_callback = Box::new(move |status: String| {
                 let display = display_clone.clone();
                 let node_id = node_id;
@@ -446,8 +660,8 @@ async fn start_batch_from_file_with_runtime(
                     display.update_node_status(node_id, status).await;
                 });
             });
-            
-            // 启动内存优化的认证证明循环
+
+            // Start memory-optimized authenticated proving loop
             match crate::prover_runtime::run_authenticated_proving_optimized(
                 node_id,
                 env,
@@ -463,36 +677,67 @@ async fn start_batch_from_file_with_runtime(
                     display.update_node_status(node_id, format!("Error: {}", e)).await;
                 }
             }
-            
+
             Ok::<(), prover::ProverError>(())
-        });
+        }).await;
+
+        join_set.spawn(handle);
     }
-    
-    // 监控和错误处理
-    monitor_runtime_workers(join_set, display).await;
-    
+
+    // Monitor and error handling
+    monitor_runtime_workers(join_set, display, task_pool).await;
+
     Ok(())
 }
 
-/// 监控高效运行时工作器
+/// Monitor optimized runtime workers
 async fn monitor_runtime_workers(
-    mut join_set: JoinSet<Result<(), prover::ProverError>>,
+    mut join_set: JoinSet<tokio::task::JoinHandle<Result<(), prover::ProverError>>>,
     display: Arc<FixedLineDisplay>,
+    task_pool: Arc<TaskPool>,
 ) {
+    let mut error_count = 0;
+    let start_time = std::time::Instant::now();
+
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(Ok(())) => {
-                // 工作器正常结束
-            }
-            Ok(Err(e)) => {
-                println!("⚠️ Worker error: {}", e);
+            Ok(task_handle) => {
+                match task_handle.await {
+                    Ok(Ok(())) => {
+                        // Worker completed successfully
+                    }
+                    Ok(Err(e)) => {
+                        error_count += 1;
+                        println!("⚠️ Worker error: {}", e);
+                    }
+                    Err(e) => {
+                        error_count += 1;
+                        println!("💥 Worker panic: {}", e);
+                    }
+                }
             }
             Err(e) => {
-                println!("💥 Worker panic: {}", e);
+                error_count += 1;
+                println!("🔥 Join error: {}", e);
             }
         }
+
+        // Update display with current statistics
+        let (active, completed, failed) = task_pool.get_stats();
+        let elapsed = start_time.elapsed();
         
-        // 更新显示
+        if completed % 10 == 0 || error_count > 0 {
+            println!("📈 Runtime Stats - Active: {}, Completed: {}, Failed: {}, Elapsed: {:?}", 
+                     active, completed, failed, elapsed);
+        }
+
         display.render_display_optimized().await;
     }
-} 
+
+    let final_elapsed = start_time.elapsed();
+    let (_, final_completed, final_failed) = task_pool.get_stats();
+    
+    println!("🏁 Batch processing completed!");
+    println!("📊 Final Stats - Completed: {}, Failed: {}, Total time: {:?}", 
+             final_completed, final_failed, final_elapsed);
+}
