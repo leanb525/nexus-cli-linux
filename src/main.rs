@@ -20,8 +20,8 @@ use ratatui::{
 };
 use std::error::Error;
 use std::path::PathBuf;
-use std::io::{self, Write}; // 修复: 使用标准库的Write
-use std::fmt::Write as FmtWrite; // 修复: 区分格式化Write
+use std::io::{self, Write};
+use std::fmt::Write as FmtWrite;
 use tokio::task::JoinSet;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -33,6 +33,11 @@ use compact_str::CompactString;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 use rayon::prelude::*;
+
+// 新增: HTTP头部随机化相关导入
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT, ACCEPT, ACCEPT_LANGUAGE, ACCEPT_ENCODING};
+use rand::Rng;
+use once_cell::sync::Lazy;
 
 mod analytics;
 mod config;
@@ -53,6 +58,188 @@ use crate::config::Config;
 use crate::environment::Environment;
 use crate::setup::clear_node_config;
 use crate::node_list::NodeList;
+
+// ========== HTTP头部随机化功能 ==========
+
+// 全球家宽IP段（主要ISP的住宅网络）
+static RESIDENTIAL_IP_RANGES: Lazy<Vec<&'static str>> = Lazy::new(|| vec![
+    // 美国主要ISP住宅网段
+    "24.0.0.0/8", "76.0.0.0/8", "98.0.0.0/8", "174.0.0.0/8",
+    "108.0.0.0/8", "173.0.0.0/8", "67.0.0.0/8", "75.0.0.0/8",
+    
+    // 加拿大住宅网段
+    "99.0.0.0/8", "142.0.0.0/8", "184.0.0.0/8", "70.0.0.0/8",
+    
+    // 英国住宅网段  
+    "86.0.0.0/8", "90.0.0.0/8", "109.0.0.0/8", "82.0.0.0/8",
+    "81.0.0.0/8", "87.0.0.0/8", "92.0.0.0/8", "94.0.0.0/8",
+    
+    // 德国住宅网段
+    "91.0.0.0/8", "93.0.0.0/8", "95.0.0.0/8", "84.0.0.0/8",
+    "85.0.0.0/8", "89.0.0.0/8", "88.0.0.0/8",
+    
+    // 法国住宅网段
+    "83.0.0.0/8", "78.0.0.0/8", "79.0.0.0/8", "80.0.0.0/8",
+    "77.0.0.0/8", "86.0.0.0/8", "90.0.0.0/8",
+    
+    // 日本住宅网段
+    "126.0.0.0/8", "133.0.0.0/8", "210.0.0.0/8", "219.0.0.0/8",
+    "220.0.0.0/8", "221.0.0.0/8", "222.0.0.0/8",
+    
+    // 韩国住宅网段
+    "175.0.0.0/8", "211.0.0.0/8", "218.0.0.0/8", "112.0.0.0/8",
+    
+    // 澳大利亚住宅网段
+    "101.0.0.0/8", "103.0.0.0/8", "110.0.0.0/8", "114.0.0.0/8",
+    "115.0.0.0/8", "116.0.0.0/8", "117.0.0.0/8", "118.0.0.0/8",
+    
+    // 新西兰住宅网段
+    "49.0.0.0/8", "122.0.0.0/8", "124.0.0.0/8", "125.0.0.0/8",
+    
+    // 荷兰住宅网段
+    "84.0.0.0/8", "85.0.0.0/8", "145.0.0.0/8", "213.0.0.0/8",
+    
+    // 瑞典住宅网段
+    "78.0.0.0/8", "81.0.0.0/8", "83.0.0.0/8", "90.0.0.0/8",
+    
+    // 挪威住宅网段
+    "84.0.0.0/8", "85.0.0.0/8", "129.0.0.0/8", "158.0.0.0/8",
+    
+    // 意大利住宅网段
+    "79.0.0.0/8", "87.0.0.0/8", "93.0.0.0/8", "95.0.0.0/8",
+    
+    // 西班牙住宅网段
+    "83.0.0.0/8", "88.0.0.0/8", "90.0.0.0/8", "95.0.0.0/8",
+    
+    // 巴西住宅网段
+    "177.0.0.0/8", "179.0.0.0/8", "186.0.0.0/8", "189.0.0.0/8",
+    
+    // 印度住宅网段
+    "117.0.0.0/8", "122.0.0.0/8", "157.0.0.0/8", "182.0.0.0/8",
+]);
+
+// 真实的浏览器User-Agent
+static USER_AGENTS: Lazy<Vec<&'static str>> = Lazy::new(|| vec![
+    // Chrome Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    
+    // Chrome macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    
+    // Firefox Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    
+    // Firefox macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13.6; rv:120.0) Gecko/20100101 Firefox/120.0",
+    
+    // Safari macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    
+    // Edge Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    
+    // Chrome Linux
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]);
+
+// 语言偏好
+static ACCEPT_LANGUAGES: Lazy<Vec<&'static str>> = Lazy::new(|| vec![
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "en-US,en;q=0.9,fr;q=0.8",
+    "en-US,en;q=0.9,de;q=0.8",
+    "en-US,en;q=0.9,ja;q=0.8",
+    "en-US,en;q=0.9,es;q=0.8",
+    "en-CA,en;q=0.9,fr;q=0.8",
+    "en-AU,en;q=0.9",
+    "en-NZ,en;q=0.9",
+]);
+
+fn generate_residential_ip() -> String {
+    let mut rng = rand::thread_rng();
+    let range = RESIDENTIAL_IP_RANGES[rng.gen_range(0..RESIDENTIAL_IP_RANGES.len())];
+    
+    // 解析CIDR并生成随机IP
+    let parts: Vec<&str> = range.split('/').collect();
+    let base_ip = parts[0];
+    let _prefix_len: u8 = parts[1].parse().unwrap_or(8);
+    
+    let ip_parts: Vec<&str> = base_ip.split('.').collect();
+    let base_octet: u8 = ip_parts[0].parse().unwrap_or(192);
+    
+    // 为了更真实，在同一个/8网段内生成随机IP
+    format!("{}.{}.{}.{}", 
+        base_octet,
+        rng.gen_range(1..255),
+        rng.gen_range(1..255),
+        rng.gen_range(1..254)
+    )
+}
+
+pub fn create_randomized_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let mut rng = rand::thread_rng();
+    
+    // 随机User-Agent
+    let ua = USER_AGENTS[rng.gen_range(0..USER_AGENTS.len())];
+    headers.insert(USER_AGENT, HeaderValue::from_str(ua).unwrap());
+    
+    // 生成随机住宅IP
+    let fake_ip = generate_residential_ip();
+    headers.insert("X-Forwarded-For", HeaderValue::from_str(&fake_ip).unwrap());
+    headers.insert("X-Real-IP", HeaderValue::from_str(&fake_ip).unwrap());
+    headers.insert("X-Client-IP", HeaderValue::from_str(&fake_ip).unwrap());
+    headers.insert("X-Remote-IP", HeaderValue::from_str(&fake_ip).unwrap());
+    headers.insert("X-Originating-IP", HeaderValue::from_str(&fake_ip).unwrap());
+    
+    // 随机Accept-Language
+    let lang = ACCEPT_LANGUAGES[rng.gen_range(0..ACCEPT_LANGUAGES.len())];
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_str(lang).unwrap());
+    
+    // 标准头部
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json,text/plain,*/*"));
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate, br"));
+    headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
+    headers.insert("Pragma", HeaderValue::from_static("no-cache"));
+    
+    // 随机连接信息
+    let connection_types = ["keep-alive", "close"];
+    let conn = connection_types[rng.gen_range(0..connection_types.len())];
+    headers.insert("Connection", HeaderValue::from_str(conn).unwrap());
+    
+    // 随机DNT
+    if rng.gen_bool(0.7) {
+        headers.insert("DNT", HeaderValue::from_static("1"));
+    }
+    
+    // 随机Sec-Fetch headers (模拟真实浏览器)
+    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
+    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
+    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
+    
+    headers
+}
+
+pub fn create_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .default_headers(create_randomized_headers())
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()
+}
+
+// ========== 原有代码继续 ==========
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -117,12 +304,12 @@ fn get_config_path() -> Result<PathBuf, ()> {
 /// Memory tracking for performance monitoring
 #[derive(Debug)]
 struct MemoryTracker {
-    #[allow(dead_code)]  // 添加这行
+    #[allow(dead_code)]
     initial_rss: AtomicU64,
     peak_rss: AtomicU64,
-    #[allow(dead_code)]  // 添加这行
+    #[allow(dead_code)]
     allocations: AtomicU64,
-} 
+}
 
 impl MemoryTracker {
     fn new() -> Self {
@@ -211,7 +398,7 @@ impl StringPool {
 
 /// Smart status cache with LRU eviction
 struct StatusCache {
-    #[allow(dead_code)]  // 添加这行
+    #[allow(dead_code)]
     cache: tokio::sync::Mutex<LruCache<u64, CompactString>>,
     hit_count: AtomicU64,
     miss_count: AtomicU64,
@@ -228,7 +415,7 @@ impl StatusCache {
         }
     }
     
-    #[allow(dead_code)]  // 添加这行
+    #[allow(dead_code)]
     async fn get_or_insert<F>(&self, key: u64, f: F) -> CompactString
     where
         F: FnOnce() -> CompactString,
@@ -259,7 +446,6 @@ impl StatusCache {
     }
 }
 
-// 修复Debug trait for StatusCache
 impl std::fmt::Debug for StatusCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StatusCache")
@@ -271,7 +457,7 @@ impl std::fmt::Debug for StatusCache {
 
 /// Optimized task pool with semaphore-based concurrency control
 struct TaskPool {
-    #[allow(dead_code)]  // 添加这行
+    #[allow(dead_code)]
     semaphore: Arc<Semaphore>,
     active_tasks: AtomicUsize,
     completed_tasks: AtomicU64,
@@ -315,7 +501,9 @@ struct FixedLineDisplay {
     node_lines: Arc<tokio::sync::RwLock<HashMap<u64, CompactString>>>,
     last_render_hash: Arc<tokio::sync::Mutex<u64>>,
     defragmenter: Arc<crate::utils::system::MemoryDefragmenter>,
+    #[allow(dead_code)]
     string_pool: Arc<StringPool>,
+    #[allow(dead_code)]
     status_cache: Arc<StatusCache>,
     memory_tracker: Arc<MemoryTracker>,
 }
@@ -336,7 +524,6 @@ impl FixedLineDisplay {
     }
 
     async fn update_node_status(&self, node_id: u64, status: String) {
-        // Convert to CompactString for better memory efficiency
         let compact_status = CompactString::new(&status);
         
         let needs_update = {
@@ -367,7 +554,6 @@ impl FixedLineDisplay {
         
         let lines = self.node_lines.read().await;
 
-        // Enhanced memory defragmentation check
         if self.defragmenter.should_defragment().await {
             let result = self.defragmenter.defragment().await;
             
@@ -383,15 +569,12 @@ impl FixedLineDisplay {
             println!("   Freed space: {} KB", result.bytes_freed / 1024);
         }
 
-        // Legacy memory pressure check as backup
         if crate::utils::system::check_memory_pressure() {
             println!("High memory usage detected, performing additional cleanup...");
             crate::utils::system::perform_memory_cleanup();
         }
 
-        // Optimized hash calculation using parallel processing for large datasets
         let current_hash = if lines.len() > 100 {
-            // Use parallel hashing for large datasets
             lines.par_iter()
                 .map(|(id, status)| {
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -401,7 +584,6 @@ impl FixedLineDisplay {
                 })
                 .reduce(|| 0, |a, b| a ^ b)
         } else {
-            // Use sequential hashing for small datasets
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             for (id, status) in lines.iter() {
                 hasher.write_u64(*id);
@@ -419,18 +601,13 @@ impl FixedLineDisplay {
     }
 
     async fn render_display(&self, lines: &HashMap<u64, CompactString>) {
-        // 修复: 使用print!而不是异步写入
         print!("\x1b[2J\x1b[H");
 
-        // Use string pool for time formatting
         let time_buffer = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
-        let _ = write!(time_buffer, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
 
-        // Title - 修复: 移除emoji，使用ASCII字符
         println!("Nexus Enhanced Batch Mining Monitor - {}", time_buffer);
         println!("=======================================");
 
-        // Optimized statistics calculation using parallel processing
         let (total_nodes, successful_count, failed_count, active_count) = if lines.len() > 50 {
             lines.par_iter()
                 .map(|(_, status)| {
@@ -458,7 +635,6 @@ impl FixedLineDisplay {
         println!("Status: {} Total | {} Active | {} Success | {} Failed", 
                  total_nodes, active_count, successful_count, failed_count);
 
-        // Enhanced memory statistics
         let stats = self.defragmenter.get_stats().await;
         let cache_hit_rate = self.status_cache.get_hit_rate() * 100.0;
         
@@ -477,30 +653,24 @@ impl FixedLineDisplay {
 
         println!("---------------------------------------");
 
-        // Optimized sorting using SmallVec for better performance with small collections
         let mut sorted_lines: SmallVec<[_; 32]> = SmallVec::with_capacity(lines.len());
         sorted_lines.extend(lines.iter());
         sorted_lines.sort_unstable_by_key(|(id, _)| *id);
 
-        // Write node statuses
         for (node_id, status) in sorted_lines.iter() {
             println!("Node-{}: {}", node_id, status);
         }
 
         println!("---------------------------------------");
         println!("Press Ctrl+C to stop all miners");
+        println!("HTTP Headers: Randomized with residential IPs");  // 新增提示
 
-        // Return string to pool
-        let time_buffer = format!("{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
-
-        // 修复: 使用标准库flush
         let _ = io::stdout().flush();
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize logger with optimized settings
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .format_timestamp_secs()
@@ -558,7 +728,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Starts the Nexus CLI application.
 async fn start(node_id: Option<u64>, env: Environment) -> Result<(), Box<dyn Error>> {
     if node_id.is_some() {
         start_headless_prover(node_id, env).await
@@ -567,7 +736,6 @@ async fn start(node_id: Option<u64>, env: Environment) -> Result<(), Box<dyn Err
     }
 }
 
-/// Start with UI (original logic)
 async fn start_with_ui(
     node_id: Option<u64>,
     env: Environment,
@@ -603,7 +771,6 @@ async fn start_headless_prover(
     Ok(())
 }
 
-/// High-efficiency batch launcher using optimized prover_runtime architecture
 async fn start_batch_from_file_with_runtime(
     file_path: &str,
     env: Environment,
@@ -629,15 +796,14 @@ async fn start_batch_from_file_with_runtime(
     println!("Environment: {:?}", env);
     println!("Architecture: High-efficiency prover_runtime");
     println!("Memory optimization: ENABLED");
+    println!("HTTP Headers: Randomized residential IPs");  // 新增提示
     println!("---------------------------------------");
 
-    // Create optimized display manager
     let display = Arc::new(FixedLineDisplay::new(actual_concurrent));
     display.render_display(&HashMap::new()).await;
 
-    // Use optimized task pool
     let task_pool = Arc::new(TaskPool::new(actual_concurrent));
-    let mut join_set = JoinSet::new(); // 修复: 正确的JoinSet类型
+    let mut join_set = JoinSet::new();
     let (shutdown_sender, _) = broadcast::channel(1);
 
     for (index, node_id) in all_nodes.iter().take(actual_concurrent).enumerate() {
@@ -646,17 +812,14 @@ async fn start_batch_from_file_with_runtime(
         let display = display.clone();
         let shutdown_rx = shutdown_sender.subscribe();
 
-        // Add startup delay
         if index > 0 {
             tokio::time::sleep(std::time::Duration::from_secs_f64(start_delay)).await;
         }
 
-        // 修复: 直接spawn任务而不是嵌套JoinHandle
         join_set.spawn(async move {
             let prefix = format!("Node-{}", node_id);
             let display_clone = display.clone();
 
-            // Create status callback for fixed position display
             let status_callback = Box::new(move |status: String| {
                 let display = display_clone.clone();
                 let node_id = node_id;
@@ -665,7 +828,6 @@ async fn start_batch_from_file_with_runtime(
                 });
             });
 
-            // Start memory-optimized authenticated proving loop
             match crate::prover_runtime::run_authenticated_proving_optimized(
                 node_id,
                 env,
@@ -686,15 +848,13 @@ async fn start_batch_from_file_with_runtime(
         });
     }
 
-    // Monitor and error handling
     monitor_runtime_workers(join_set, display, task_pool).await;
 
     Ok(())
 }
 
-/// Monitor optimized runtime workers - 修复JoinSet类型
 async fn monitor_runtime_workers(
-    mut join_set: JoinSet<Result<(), prover::ProverError>>, // 修复: 正确的类型
+    mut join_set: JoinSet<Result<(), prover::ProverError>>,
     display: Arc<FixedLineDisplay>,
     task_pool: Arc<TaskPool>,
 ) {
@@ -716,7 +876,6 @@ async fn monitor_runtime_workers(
             }
         }
 
-        // Update display with current statistics
         let (active, completed, failed) = task_pool.get_stats();
         let elapsed = start_time.elapsed();
         
